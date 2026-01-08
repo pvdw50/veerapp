@@ -2,4 +2,8 @@ streamlit
 psycopg2-binary
 streamlit-qrcode-scanner
 pandas
+qrcode
+reportlab
+Pillow
+
 
