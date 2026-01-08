@@ -1,9 +1,18 @@
 # app.py
 # Streamlit app: Leser safetyvalve spring stock
-# - Medewerker: QR scan -> duidelijke scan-success melding -> verbruik boeken -> duidelijke boekingsmelding
-# - Admin: voorraad overzicht + CSV export + ontvangst boeken EN direct label-PDF genereren (DYMO) in één actie
-# - Email notificatie bij verbruik (SMTP env vars)
-# - Admin pincode gate (ADMIN_PIN)
+# ✅ Medewerker:
+#   - QR scan (met ✅ melding + 🔊 beep 1x per scan)
+#   - Verbruik (afboeken voorraad) met duidelijke bevestiging op scherm
+#   - Email notificatie bij verbruik (SMTP env vars)
+# ✅ Admin (pincode):
+#   - Voorraad overzicht + CSV export
+#   - Ontvangst boeken (voorraad +) EN direct label-PDF genereren (DYMO) in één actie
+#   - Logboek transacties
+#
+# Railway env vars:
+#   DATABASE_URL (required)
+#   ADMIN_PIN (required for admin)
+#   EMAIL_TO, EMAIL_FROM, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS (optional for email)
 
 import os
 import re
@@ -22,6 +31,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 
+
 # -----------------------------
 # Validation / formats
 # -----------------------------
@@ -34,6 +44,27 @@ LABEL_W_MM = 89
 LABEL_H_MM = 36
 
 DEFAULT_ORDER_LETTERS = ["R", "S", "I", "W", "X"]  # pas aan indien gewenst
+
+
+# -----------------------------
+# Small UX: browser beep on scan
+# -----------------------------
+def play_beep():
+    """
+    Speelt een korte 'beep' af via de browser.
+    Wordt aangeroepen direct na succesvolle scan (user-interactie),
+    en door scan_ok gating speelt het maar 1x per scan.
+    """
+    # ultrakorte embedded WAV (base64)
+    beep_base64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
+    st.markdown(
+        f"""
+        <audio autoplay>
+            <source src="data:audio/wav;base64,{beep_base64}" type="audio/wav">
+        </audio>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # -----------------------------
@@ -144,8 +175,7 @@ def fetch_spring_numbers():
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT spring_no FROM springs ORDER BY spring_no ASC")
-            rows = cur.fetchall()
-            return [r[0] for r in rows]
+            return [r[0] for r in cur.fetchall()]
 
 
 # -----------------------------
@@ -225,17 +255,22 @@ def make_label_pdf(spring_no: str, count: int) -> bytes:
     text_size = 12
 
     for _ in range(count):
-        # Tekst linksboven
         c.setFont("Helvetica-Bold", text_size)
         c.drawString(4 * mm, (LABEL_H_MM - 12) * mm, spring_no)
 
-        # QR rechts
         img_buf = io.BytesIO()
         img.save(img_buf, format="PNG")
         img_buf.seek(0)
+
         x = (LABEL_W_MM - qr_size_mm - 4) * mm
         y = (LABEL_H_MM - qr_size_mm - 4) * mm
-        c.drawImage(ImageReader(img_buf), x, y, qr_size_mm * mm, qr_size_mm * mm, preserveAspectRatio=True, mask="auto")
+        c.drawImage(
+            ImageReader(img_buf),
+            x, y,
+            qr_size_mm * mm, qr_size_mm * mm,
+            preserveAspectRatio=True,
+            mask="auto",
+        )
 
         c.showPage()
 
@@ -275,7 +310,7 @@ ensure_tables()
 # Session defaults
 st.session_state.setdefault("spring_no", "")
 st.session_state.setdefault("scan_ok", False)
-st.session_state.setdefault("last_use_success", None)   # dict with last use info
+st.session_state.setdefault("last_use_success", None)   # dict with last use info (for on-screen confirmation)
 st.session_state.setdefault("last_receive_pdf", None)   # bytes
 st.session_state.setdefault("last_receive_pdf_name", None)
 
@@ -299,6 +334,11 @@ if page == "📱 Verbruik (medewerker)":
 **Voorraad:** {info['before']} → {info['after']}
 """
         )
+        if info.get("email_ok"):
+            st.info("📧 Email melding verstuurd.")
+        else:
+            st.warning(f"📧 Geen email verstuurd: {info.get('email_msg')}")
+
         st.info("🔄 Klaar voor volgende scan")
         if st.button("Nieuwe scan"):
             st.session_state["last_use_success"] = None
@@ -307,17 +347,18 @@ if page == "📱 Verbruik (medewerker)":
     st.subheader("1) Scan QR")
     qr = qrcode_scanner(key="scan")
 
-    if qr:
+    # Beep + success markering exact 1x per scan
+    if qr and not st.session_state.get("scan_ok"):
         st.session_state["spring_no"] = qr.strip()
         st.session_state["scan_ok"] = True
+        play_beep()
 
     spring_no = st.session_state.get("spring_no", "")
 
     # Melding bij succesvolle scan
     if st.session_state.get("scan_ok") and spring_no:
         st.success(f"✅ QR gescand – Veernummer: **{spring_no}**")
-
-    if not spring_no:
+    else:
         st.info("📷 Richt de camera op de QR-code om te scannen.")
 
     st.subheader("2) Verbruik registreren")
@@ -334,6 +375,11 @@ if page == "📱 Verbruik (medewerker)":
         seq = oc4.text_input("Volgnummer", placeholder="01")
 
         qty = st.number_input("Aantal", min_value=1, step=1, value=1)
+
+        # Preview
+        if customer_code.strip() and year_2.strip() and seq.strip():
+            st.caption(f"Voorbeeld: **{build_order_no(customer_code.strip(), year_2.strip(), letter, seq.strip()).upper()}**")
+
         submit = st.form_submit_button("✅ Verbruik (afboeken)")
 
     if submit:
@@ -342,7 +388,6 @@ if page == "📱 Verbruik (medewerker)":
         customer_clean = customer_code.strip()
         year_clean = year_2.strip()
         seq_clean = seq.strip()
-
         order_no = build_order_no(customer_clean, year_clean, letter, seq_clean).upper()
 
         errors = []
@@ -368,7 +413,7 @@ if page == "📱 Verbruik (medewerker)":
             try:
                 before, after = use_stock(spring_clean, int(qty), initials_clean, order_no)
 
-                # Email notificatie
+                # Email notificatie (fail-safe)
                 subj = f"Veer gebruikt – {order_no}"
                 body = (
                     f"Er is een veer gebruikt.\n\n"
@@ -381,7 +426,7 @@ if page == "📱 Verbruik (medewerker)":
                 )
                 ok, msg = send_email(subj, body)
 
-                # UI feedback: success blok + (optioneel) mail status
+                # Bewaar succes voor duidelijke confirmation na rerun
                 st.session_state["last_use_success"] = {
                     "spring_no": spring_clean,
                     "order_no": order_no,
@@ -392,23 +437,14 @@ if page == "📱 Verbruik (medewerker)":
                     "email_msg": msg,
                 }
 
-                # reset scan state for next run
+                # reset scan state
                 st.session_state["spring_no"] = ""
                 st.session_state["scan_ok"] = False
 
-                # Toon korte status over mail (bij volgende render tonen we het erbij)
                 st.rerun()
 
             except ValueError as ve:
                 st.error(str(ve))
-
-    # Als we net een succes hadden, toon mailstatus als extra info
-    if st.session_state.get("last_use_success"):
-        info = st.session_state["last_use_success"]
-        if info.get("email_ok"):
-            st.info("📧 Email melding verstuurd.")
-        else:
-            st.warning(f"📧 Geen email verstuurd: {info.get('email_msg')}")
 
 # =============================
 # PAGE 2: Admin voorraad + ontvangst + labels
@@ -418,7 +454,6 @@ else:
     if not admin_gate():
         st.stop()
 
-    # Voorraad overzicht
     st.subheader("Voorraad overzicht")
     stock_df = fetch_stock_df()
     if stock_df.empty:
@@ -437,10 +472,9 @@ else:
     st.divider()
     st.subheader("Ontvangst boeken + labels printen (1x)")
 
-    # Handig: dropdown van bestaande veernummers, maar ook vrij typen
     existing = fetch_spring_numbers()
-    spring_pick = st.selectbox("Bestaand veernummer (optioneel)", options=["(nieuw)"] + existing)
-    default_spring = "" if spring_pick == "(nieuw)" else spring_pick
+    picked = st.selectbox("Bestaand veernummer (optioneel)", options=["(nieuw)"] + existing)
+    default_spring = "" if picked == "(nieuw)" else picked
 
     with st.form("receive_and_labels_form", clear_on_submit=True):
         spring_no = st.text_input("Veernummer", value=default_spring, placeholder="LSR-12345")
@@ -451,7 +485,6 @@ else:
         labels_count = c2.number_input("Aantal labels te printen", min_value=1, step=1, value=1)
 
         note = st.text_input("Opmerking (optioneel)", placeholder="Levering / pakbon ...")
-
         submit = st.form_submit_button("➕ Ontvangst boeken & labels maken")
 
     if submit:
