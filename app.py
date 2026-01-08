@@ -16,7 +16,7 @@ from reportlab.lib.units import mm
 from PIL import Image
 
 
-ORDER_RE = re.compile(r"^\d{3}-\d{2}R\d{2}$")   # 005-26R01
+ORDER_RE = re.compile(r"^\d{3}-\d{2}[A-Z]\d+$")   # 005-26R01
 INITIALS_RE = re.compile(r"^[A-Z]{2}$")         # 2 letters
 
 # DYMO LabelWriter 99012 = 36mm x 89mm (default)
