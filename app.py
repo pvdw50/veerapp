@@ -1,19 +1,4 @@
 # app.py
-# Streamlit app: Leser safetyvalve spring stock
-# ✅ Medewerker:
-#   - QR scan (met ✅ melding + 🔊 beep 1x per scan)
-#   - Verbruik (afboeken voorraad) met duidelijke bevestiging op scherm
-#   - Email notificatie bij verbruik (SMTP env vars)
-# ✅ Admin (pincode):
-#   - Voorraad overzicht + CSV export
-#   - Ontvangst boeken (voorraad +) EN direct label-PDF genereren (DYMO) in één actie
-#   - Logboek transacties
-#
-# Railway env vars:
-#   DATABASE_URL (required)
-#   ADMIN_PIN (required for admin)
-#   EMAIL_TO, EMAIL_FROM, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS (optional for email)
-
 import os
 import re
 import io
@@ -31,11 +16,10 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 
-
 # -----------------------------
 # Validation / formats
 # -----------------------------
-# Flexibel orderformat: ddd-yyL<digits...>  (bv. 005-26R01, 005-26S1, 123-27R001)
+# Flexibel KEN orderformat: ddd-yyL<digits...>  (bv. 005-26R01, 005-26S1, 123-27R001)
 ORDER_RE = re.compile(r"^\d{3}-\d{2}[A-Z]\d+$")
 INITIALS_RE = re.compile(r"^[A-Z]{2}$")
 
@@ -43,18 +27,11 @@ INITIALS_RE = re.compile(r"^[A-Z]{2}$")
 LABEL_W_MM = 89
 LABEL_H_MM = 36
 
-DEFAULT_ORDER_LETTERS = ["R", "S", "I", "W", "X"]  # pas aan indien gewenst
-
 
 # -----------------------------
-# Small UX: browser beep on scan
+# UX: browser beep on scan
 # -----------------------------
 def play_beep():
-    """
-    Speelt een korte 'beep' af via de browser.
-    Wordt aangeroepen direct na succesvolle scan (user-interactie),
-    en door scan_ok gating speelt het maar 1x per scan.
-    """
     # ultrakorte embedded WAV (base64)
     beep_base64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
     st.markdown(
@@ -65,6 +42,25 @@ def play_beep():
         """,
         unsafe_allow_html=True,
     )
+
+
+def normalize_scan_value(qr_result) -> str:
+    """
+    Maakt scan-output robuust:
+    - soms string
+    - soms dict/object met 'text' of 'data'
+    - altijd terug als nette string
+    """
+    if qr_result is None:
+        return ""
+    if isinstance(qr_result, str):
+        return qr_result.strip()
+    if isinstance(qr_result, dict):
+        for k in ("text", "data", "raw", "result", "value"):
+            if k in qr_result and qr_result[k]:
+                return str(qr_result[k]).strip()
+        return str(qr_result).strip()
+    return str(qr_result).strip()
 
 
 # -----------------------------
@@ -239,10 +235,6 @@ def admin_gate():
 # QR label PDF generator (DYMO)
 # -----------------------------
 def make_label_pdf(spring_no: str, count: int) -> bytes:
-    """
-    1 label per pagina. QR bevat het veernummer.
-    Standaard labelmaat: 89x36mm (DYMO 99012).
-    """
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=(LABEL_W_MM * mm, LABEL_H_MM * mm))
 
@@ -264,41 +256,12 @@ def make_label_pdf(spring_no: str, count: int) -> bytes:
 
         x = (LABEL_W_MM - qr_size_mm - 4) * mm
         y = (LABEL_H_MM - qr_size_mm - 4) * mm
-        c.drawImage(
-            ImageReader(img_buf),
-            x, y,
-            qr_size_mm * mm, qr_size_mm * mm,
-            preserveAspectRatio=True,
-            mask="auto",
-        )
-
+        c.drawImage(ImageReader(img_buf), x, y, qr_size_mm * mm, qr_size_mm * mm,
+                    preserveAspectRatio=True, mask="auto")
         c.showPage()
 
     c.save()
     return buf.getvalue()
-
-
-# -----------------------------
-# Order input helpers
-# -----------------------------
-def current_year_2digits():
-    return f"{datetime.now(timezone.utc).year % 100:02d}"
-
-
-def build_order_no(customer_code: str, year_2: str, letter: str, seq: str) -> str:
-    return f"{customer_code}-{year_2}{letter}{seq}"
-
-
-def valid_customer_code(s: str) -> bool:
-    return bool(re.fullmatch(r"\d{3}", s))
-
-
-def valid_year2(s: str) -> bool:
-    return bool(re.fullmatch(r"\d{2}", s))
-
-
-def valid_seq(s: str) -> bool:
-    return bool(re.fullmatch(r"\d+", s))
 
 
 # -----------------------------
@@ -309,9 +272,9 @@ ensure_tables()
 
 # Session defaults
 st.session_state.setdefault("spring_no", "")
-st.session_state.setdefault("scan_ok", False)
-st.session_state.setdefault("last_use_success", None)   # dict with last use info (for on-screen confirmation)
-st.session_state.setdefault("last_receive_pdf", None)   # bytes
+st.session_state.setdefault("last_scanned", "")          # helpt om beep 1x per nieuwe scan te doen
+st.session_state.setdefault("last_use_success", None)
+st.session_state.setdefault("last_receive_pdf", None)
 st.session_state.setdefault("last_receive_pdf_name", None)
 
 page = st.sidebar.radio("Menu", ["📱 Verbruik (medewerker)", "📦 Voorraad & Ontvangst (admin)"])
@@ -322,7 +285,7 @@ page = st.sidebar.radio("Menu", ["📱 Verbruik (medewerker)", "📦 Voorraad & 
 if page == "📱 Verbruik (medewerker)":
     st.title("Veer verbruik (QR)")
 
-    # Toon laatste succesvolle afboeking (blijft staan na rerun)
+    # Laatste succesvolle afboeking
     if st.session_state.get("last_use_success"):
         info = st.session_state["last_use_success"]
         st.success(
@@ -338,70 +301,51 @@ if page == "📱 Verbruik (medewerker)":
             st.info("📧 Email melding verstuurd.")
         else:
             st.warning(f"📧 Geen email verstuurd: {info.get('email_msg')}")
-
         st.info("🔄 Klaar voor volgende scan")
         if st.button("Nieuwe scan"):
             st.session_state["last_use_success"] = None
             st.rerun()
 
     st.subheader("1) Scan QR")
-    qr = qrcode_scanner(key="scan")
+    qr_raw = qrcode_scanner(key="scan")
+    qr_text = normalize_scan_value(qr_raw)
 
-    # Beep + success markering exact 1x per scan
-    if qr and not st.session_state.get("scan_ok"):
-        st.session_state["spring_no"] = qr.strip()
-        st.session_state["scan_ok"] = True
-        play_beep()
+    if qr_text:
+        # beep alleen als het echt een nieuwe scan is
+        if qr_text != st.session_state.get("last_scanned", ""):
+            st.session_state["spring_no"] = qr_text
+            st.session_state["last_scanned"] = qr_text
+            play_beep()
 
     spring_no = st.session_state.get("spring_no", "")
 
-    # Melding bij succesvolle scan
-    if st.session_state.get("scan_ok") and spring_no:
+    if spring_no:
         st.success(f"✅ QR gescand – Veernummer: **{spring_no}**")
     else:
         st.info("📷 Richt de camera op de QR-code om te scannen.")
 
     st.subheader("2) Verbruik registreren")
-
     with st.form("use_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         initials = c1.text_input("Initialen (2 letters)", max_chars=2, placeholder="PV")
-
-        st.markdown("**Ordernummer** (format: `005-26R01` / `ddd-yyLnnn...`)")
-        oc1, oc2, oc3, oc4 = st.columns([1, 1, 1, 2])
-        customer_code = oc1.text_input("Klant (ddd)", max_chars=3, placeholder="005")
-        year_2 = oc2.text_input("Jaar (yy)", max_chars=2, value=current_year_2digits())
-        letter = oc3.selectbox("Letter", options=DEFAULT_ORDER_LETTERS, index=0)
-        seq = oc4.text_input("Volgnummer", placeholder="01")
+        order_no = c2.text_input("Ordernummer", placeholder="005-26R01")
 
         qty = st.number_input("Aantal", min_value=1, step=1, value=1)
-
-        # Preview
-        if customer_code.strip() and year_2.strip() and seq.strip():
-            st.caption(f"Voorbeeld: **{build_order_no(customer_code.strip(), year_2.strip(), letter, seq.strip()).upper()}**")
+        st.caption("Format: 005-26R01 (ddd-yyLnnn...)")
 
         submit = st.form_submit_button("✅ Verbruik (afboeken)")
 
     if submit:
         initials_clean = initials.strip().upper()
+        order_clean = order_no.strip().upper()
         spring_clean = (spring_no or "").strip()
-        customer_clean = customer_code.strip()
-        year_clean = year_2.strip()
-        seq_clean = seq.strip()
-        order_no = build_order_no(customer_clean, year_clean, letter, seq_clean).upper()
 
         errors = []
         if not spring_clean:
             errors.append("Scan eerst een QR-code (veernummer ontbreekt).")
         if not INITIALS_RE.match(initials_clean):
             errors.append("Initialen moeten precies 2 letters zijn (bv. PV).")
-        if not valid_customer_code(customer_clean):
-            errors.append("Klantcode moet exact 3 cijfers zijn (bv. 005).")
-        if not valid_year2(year_clean):
-            errors.append("Jaar moet exact 2 cijfers zijn (bv. 26).")
-        if not valid_seq(seq_clean):
-            errors.append("Volgnummer moet alleen cijfers bevatten (bv. 01, 1, 001).")
-        if not ORDER_RE.match(order_no):
+        if not ORDER_RE.match(order_clean):
             errors.append("Ordernummer ongeldig. Verwacht bv. 005-26R01 (ddd-yyLnnn...).")
         if int(qty) < 1:
             errors.append("Aantal moet 1 of groter zijn.")
@@ -411,13 +355,13 @@ if page == "📱 Verbruik (medewerker)":
                 st.error(e)
         else:
             try:
-                before, after = use_stock(spring_clean, int(qty), initials_clean, order_no)
+                before, after = use_stock(spring_clean, int(qty), initials_clean, order_clean)
 
-                # Email notificatie (fail-safe)
-                subj = f"Veer gebruikt – {order_no}"
+                # Email (fail-safe)
+                subj = f"Veer gebruikt – {order_clean}"
                 body = (
                     f"Er is een veer gebruikt.\n\n"
-                    f"Order: {order_no}\n"
+                    f"Order: {order_clean}\n"
                     f"Veer: {spring_clean}\n"
                     f"Aantal: {int(qty)}\n"
                     f"Medewerker: {initials_clean}\n"
@@ -426,10 +370,9 @@ if page == "📱 Verbruik (medewerker)":
                 )
                 ok, msg = send_email(subj, body)
 
-                # Bewaar succes voor duidelijke confirmation na rerun
                 st.session_state["last_use_success"] = {
                     "spring_no": spring_clean,
-                    "order_no": order_no,
+                    "order_no": order_clean,
                     "qty": int(qty),
                     "before": before,
                     "after": after,
@@ -437,12 +380,11 @@ if page == "📱 Verbruik (medewerker)":
                     "email_msg": msg,
                 }
 
-                # reset scan state
+                # reset voor volgende scan
                 st.session_state["spring_no"] = ""
-                st.session_state["scan_ok"] = False
+                st.session_state["last_scanned"] = ""  # zodat volgende scan weer beep geeft
 
                 st.rerun()
-
             except ValueError as ve:
                 st.error(str(ve))
 
@@ -460,7 +402,6 @@ else:
         st.info("Nog geen veernummers in voorraad. Boek eerst een ontvangst.")
     else:
         st.dataframe(stock_df[["spring_no", "qty_on_hand", "updated_at"]], use_container_width=True)
-
         csv_bytes = stock_df[["spring_no", "qty_on_hand"]].to_csv(index=False).encode("utf-8")
         st.download_button(
             "⬇️ Download voorraad CSV",
@@ -493,8 +434,8 @@ else:
             st.error("Veernummer is verplicht.")
         else:
             label_qty = int(qty_received) if auto_labels else int(labels_count)
-
             before, after = receive_stock(spring_clean, int(qty_received), note=note.strip() or None)
+
             st.success(f"✅ Ontvangst geboekt: {spring_clean} +{int(qty_received)} (voorraad {before} → {after})")
 
             pdf = make_label_pdf(spring_clean, label_qty)
@@ -504,7 +445,6 @@ else:
             st.success(f"✅ Labels gegenereerd ({label_qty} stuks). Download hieronder en print via DYMO Connect.")
             st.rerun()
 
-    # Download knop blijft beschikbaar na rerun
     if st.session_state.get("last_receive_pdf"):
         st.download_button(
             "⬇️ Download label PDF",
