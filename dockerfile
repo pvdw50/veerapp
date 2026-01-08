@@ -7,7 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-ENV PORT=8080
-EXPOSE 8080
-
+# Railway gebruikt de PORT env var
 CMD ["sh","-c","streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true"]
+
