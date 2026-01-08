@@ -1,4 +1,20 @@
 # app.py
+# Streamlit app: Leser safetyvalve spring stock
+# ✅ Medewerker:
+#   - QR scan -> ✅ melding + 🔊 beep 1x per nieuwe scan (robuste scan parsing)
+#   - 1 veld ordernummer + 1 veld initialen (extra robuust tegen spaties/puntjes/autocorrect)
+#   - Verbruik (afboeken) -> duidelijke bevestiging op scherm (blijft staan)
+#   - Email notificatie bij verbruik (SMTP env vars) (fail-safe)
+# ✅ Admin (pincode):
+#   - Voorraad overzicht + CSV export
+#   - Ontvangst boeken (voorraad +) EN direct label-PDF genereren (DYMO) in één actie
+#   - Logboek transacties
+#
+# Railway env vars:
+#   DATABASE_URL (required)
+#   ADMIN_PIN (required for admin)
+#   EMAIL_TO, EMAIL_FROM, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS (optional for email)
+
 import os
 import re
 import io
@@ -16,6 +32,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 
+
 # -----------------------------
 # Validation / formats
 # -----------------------------
@@ -26,6 +43,38 @@ INITIALS_RE = re.compile(r"^[A-Z]{2}$")
 # DYMO 99012 default: 89mm x 36mm (breedte x hoogte)
 LABEL_W_MM = 89
 LABEL_H_MM = 36
+
+
+# -----------------------------
+# Robust normalization
+# -----------------------------
+def normalize_initials(s: str) -> str:
+    # Houd alleen letters over, uppercase, neem eerste 2
+    letters = "".join(ch for ch in (s or "") if ch.isalpha()).upper()
+    return letters[:2]
+
+
+def normalize_order_no(s: str) -> str:
+    # Spaties eruit, uppercase
+    return (s or "").replace(" ", "").upper().strip()
+
+
+def normalize_scan_value(qr_result) -> str:
+    """
+    Scanner output is niet altijd een string (soms dict/object).
+    We normaliseren naar een nette string.
+    """
+    if qr_result is None:
+        return ""
+    if isinstance(qr_result, str):
+        return qr_result.strip()
+    if isinstance(qr_result, dict):
+        for k in ("text", "data", "raw", "result", "value"):
+            v = qr_result.get(k)
+            if v:
+                return str(v).strip()
+        return str(qr_result).strip()
+    return str(qr_result).strip()
 
 
 # -----------------------------
@@ -42,25 +91,6 @@ def play_beep():
         """,
         unsafe_allow_html=True,
     )
-
-
-def normalize_scan_value(qr_result) -> str:
-    """
-    Maakt scan-output robuust:
-    - soms string
-    - soms dict/object met 'text' of 'data'
-    - altijd terug als nette string
-    """
-    if qr_result is None:
-        return ""
-    if isinstance(qr_result, str):
-        return qr_result.strip()
-    if isinstance(qr_result, dict):
-        for k in ("text", "data", "raw", "result", "value"):
-            if k in qr_result and qr_result[k]:
-                return str(qr_result[k]).strip()
-        return str(qr_result).strip()
-    return str(qr_result).strip()
 
 
 # -----------------------------
@@ -256,8 +286,13 @@ def make_label_pdf(spring_no: str, count: int) -> bytes:
 
         x = (LABEL_W_MM - qr_size_mm - 4) * mm
         y = (LABEL_H_MM - qr_size_mm - 4) * mm
-        c.drawImage(ImageReader(img_buf), x, y, qr_size_mm * mm, qr_size_mm * mm,
-                    preserveAspectRatio=True, mask="auto")
+        c.drawImage(
+            ImageReader(img_buf),
+            x, y,
+            qr_size_mm * mm, qr_size_mm * mm,
+            preserveAspectRatio=True,
+            mask="auto",
+        )
         c.showPage()
 
     c.save()
@@ -272,10 +307,14 @@ ensure_tables()
 
 # Session defaults
 st.session_state.setdefault("spring_no", "")
-st.session_state.setdefault("last_scanned", "")          # helpt om beep 1x per nieuwe scan te doen
-st.session_state.setdefault("last_use_success", None)
-st.session_state.setdefault("last_receive_pdf", None)
+st.session_state.setdefault("last_scanned", "")          # beep gating
+st.session_state.setdefault("last_use_success", None)    # dict
+st.session_state.setdefault("last_receive_pdf", None)    # bytes
 st.session_state.setdefault("last_receive_pdf_name", None)
+
+# Persist input fields across reruns (mobile friendly)
+st.session_state.setdefault("initials_raw", "")
+st.session_state.setdefault("order_raw", "")
 
 page = st.sidebar.radio("Menu", ["📱 Verbruik (medewerker)", "📦 Voorraad & Ontvangst (admin)"])
 
@@ -301,6 +340,7 @@ if page == "📱 Verbruik (medewerker)":
             st.info("📧 Email melding verstuurd.")
         else:
             st.warning(f"📧 Geen email verstuurd: {info.get('email_msg')}")
+
         st.info("🔄 Klaar voor volgende scan")
         if st.button("Nieuwe scan"):
             st.session_state["last_use_success"] = None
@@ -311,7 +351,6 @@ if page == "📱 Verbruik (medewerker)":
     qr_text = normalize_scan_value(qr_raw)
 
     if qr_text:
-        # beep alleen als het echt een nieuwe scan is
         if qr_text != st.session_state.get("last_scanned", ""):
             st.session_state["spring_no"] = qr_text
             st.session_state["last_scanned"] = qr_text
@@ -325,26 +364,40 @@ if page == "📱 Verbruik (medewerker)":
         st.info("📷 Richt de camera op de QR-code om te scannen.")
 
     st.subheader("2) Verbruik registreren")
-    with st.form("use_form", clear_on_submit=True):
+
+    with st.form("use_form", clear_on_submit=False):
         c1, c2 = st.columns(2)
-        initials = c1.text_input("Initialen (2 letters)", max_chars=2, placeholder="PV")
-        order_no = c2.text_input("Ordernummer", placeholder="005-26R01")
+
+        initials_raw = c1.text_input(
+            "Initialen (2 letters)",
+            key="initials_raw",
+            placeholder="PV",
+        )
+
+        order_raw = c2.text_input(
+            "Ordernummer",
+            key="order_raw",
+            placeholder="005-26R01",
+        )
 
         qty = st.number_input("Aantal", min_value=1, step=1, value=1)
-        st.caption("Format: 005-26R01 (ddd-yyLnnn...)")
+
+        initials_preview = normalize_initials(initials_raw)
+        order_preview = normalize_order_no(order_raw)
+        st.caption(f"Herkenning: initialen **{initials_preview or '-'}**, order **{order_preview or '-'}**")
 
         submit = st.form_submit_button("✅ Verbruik (afboeken)")
 
     if submit:
-        initials_clean = initials.strip().upper()
-        order_clean = order_no.strip().upper()
+        initials_clean = normalize_initials(st.session_state.get("initials_raw", ""))
+        order_clean = normalize_order_no(st.session_state.get("order_raw", ""))
         spring_clean = (spring_no or "").strip()
 
         errors = []
         if not spring_clean:
             errors.append("Scan eerst een QR-code (veernummer ontbreekt).")
         if not INITIALS_RE.match(initials_clean):
-            errors.append("Initialen moeten precies 2 letters zijn (bv. PV).")
+            errors.append("Initialen moeten 2 letters zijn (bv. PV).")
         if not ORDER_RE.match(order_clean):
             errors.append("Ordernummer ongeldig. Verwacht bv. 005-26R01 (ddd-yyLnnn...).")
         if int(qty) < 1:
@@ -357,7 +410,6 @@ if page == "📱 Verbruik (medewerker)":
             try:
                 before, after = use_stock(spring_clean, int(qty), initials_clean, order_clean)
 
-                # Email (fail-safe)
                 subj = f"Veer gebruikt – {order_clean}"
                 body = (
                     f"Er is een veer gebruikt.\n\n"
@@ -382,9 +434,11 @@ if page == "📱 Verbruik (medewerker)":
 
                 # reset voor volgende scan
                 st.session_state["spring_no"] = ""
-                st.session_state["last_scanned"] = ""  # zodat volgende scan weer beep geeft
+                st.session_state["last_scanned"] = ""
 
+                # laat initialen/order staan (handig bij meerdere verbruiken op zelfde order)
                 st.rerun()
+
             except ValueError as ve:
                 st.error(str(ve))
 
