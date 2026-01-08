@@ -3,7 +3,8 @@
 # ✅ Medewerker:
 #   - QR scan -> ✅ melding + 🔊 beep 1x per nieuwe scan (robuste scan parsing)
 #   - 1 veld ordernummer + 1 veld initialen (extra robuust tegen spaties/puntjes/autocorrect)
-#   - Verbruik (afboeken) -> duidelijke bevestiging op scherm (blijft staan)
+#   - Verbruik (afboeken) -> DIRECTE bevestiging op scherm (geen automatische rerun die de melding wegpoetst)
+#   - Knop "➡️ Volgende scan" om te resetten en door te gaan
 #   - Email notificatie bij verbruik (SMTP env vars) (fail-safe)
 # ✅ Admin (pincode):
 #   - Voorraad overzicht + CSV export
@@ -49,21 +50,15 @@ LABEL_H_MM = 36
 # Robust normalization
 # -----------------------------
 def normalize_initials(s: str) -> str:
-    # Houd alleen letters over, uppercase, neem eerste 2
     letters = "".join(ch for ch in (s or "") if ch.isalpha()).upper()
     return letters[:2]
 
 
 def normalize_order_no(s: str) -> str:
-    # Spaties eruit, uppercase
     return (s or "").replace(" ", "").upper().strip()
 
 
 def normalize_scan_value(qr_result) -> str:
-    """
-    Scanner output is niet altijd een string (soms dict/object).
-    We normaliseren naar een nette string.
-    """
     if qr_result is None:
         return ""
     if isinstance(qr_result, str):
@@ -81,7 +76,6 @@ def normalize_scan_value(qr_result) -> str:
 # UX: browser beep on scan
 # -----------------------------
 def play_beep():
-    # ultrakorte embedded WAV (base64)
     beep_base64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
     st.markdown(
         f"""
@@ -308,7 +302,7 @@ ensure_tables()
 # Session defaults
 st.session_state.setdefault("spring_no", "")
 st.session_state.setdefault("last_scanned", "")          # beep gating
-st.session_state.setdefault("last_use_success", None)    # dict
+st.session_state.setdefault("confirm_block", None)       # dict with last confirmation to show reliably
 st.session_state.setdefault("last_receive_pdf", None)    # bytes
 st.session_state.setdefault("last_receive_pdf_name", None)
 
@@ -324,9 +318,9 @@ page = st.sidebar.radio("Menu", ["📱 Verbruik (medewerker)", "📦 Voorraad & 
 if page == "📱 Verbruik (medewerker)":
     st.title("Veer verbruik (QR)")
 
-    # Laatste succesvolle afboeking
-    if st.session_state.get("last_use_success"):
-        info = st.session_state["last_use_success"]
+    # 0) Toon bevestiging (blijft staan totdat gebruiker op "Volgende scan" klikt)
+    if st.session_state.get("confirm_block"):
+        info = st.session_state["confirm_block"]
         st.success(
             f"""✅ **Verbruik succesvol afgeboekt**
 
@@ -341,20 +335,22 @@ if page == "📱 Verbruik (medewerker)":
         else:
             st.warning(f"📧 Geen email verstuurd: {info.get('email_msg')}")
 
-        st.info("🔄 Klaar voor volgende scan")
-        if st.button("Nieuwe scan"):
-            st.session_state["last_use_success"] = None
+        if st.button("➡️ Volgende scan"):
+            st.session_state["confirm_block"] = None
+            st.session_state["spring_no"] = ""
+            st.session_state["last_scanned"] = ""
             st.rerun()
+
+        st.stop()  # stop hier zodat de rest van de pagina niet interfereert
 
     st.subheader("1) Scan QR")
     qr_raw = qrcode_scanner(key="scan")
     qr_text = normalize_scan_value(qr_raw)
 
-    if qr_text:
-        if qr_text != st.session_state.get("last_scanned", ""):
-            st.session_state["spring_no"] = qr_text
-            st.session_state["last_scanned"] = qr_text
-            play_beep()
+    if qr_text and qr_text != st.session_state.get("last_scanned", ""):
+        st.session_state["spring_no"] = qr_text
+        st.session_state["last_scanned"] = qr_text
+        play_beep()
 
     spring_no = st.session_state.get("spring_no", "")
 
@@ -385,6 +381,7 @@ if page == "📱 Verbruik (medewerker)":
         initials_preview = normalize_initials(initials_raw)
         order_preview = normalize_order_no(order_raw)
         st.caption(f"Herkenning: initialen **{initials_preview or '-'}**, order **{order_preview or '-'}**")
+        st.caption("Order format: 005-26R01 (ddd-yyLnnn...)")
 
         submit = st.form_submit_button("✅ Verbruik (afboeken)")
 
@@ -422,7 +419,8 @@ if page == "📱 Verbruik (medewerker)":
                 )
                 ok, msg = send_email(subj, body)
 
-                st.session_state["last_use_success"] = {
+                # ✅ Zet confirm block en STOP met reruns: user moet zelf "Volgende scan" klikken
+                st.session_state["confirm_block"] = {
                     "spring_no": spring_clean,
                     "order_no": order_clean,
                     "qty": int(qty),
@@ -432,11 +430,10 @@ if page == "📱 Verbruik (medewerker)":
                     "email_msg": msg,
                 }
 
-                # reset voor volgende scan
+                # scan reset alvast klaarzetten
                 st.session_state["spring_no"] = ""
                 st.session_state["last_scanned"] = ""
 
-                # laat initialen/order staan (handig bij meerdere verbruiken op zelfde order)
                 st.rerun()
 
             except ValueError as ve:
