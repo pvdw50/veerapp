@@ -1,11 +1,16 @@
 # app.py
 # Streamlit app: Leser safetyvalve spring stock
+#
 # ✅ Medewerker:
-#   - QR scan -> ✅ melding + 🔊 beep 1x per nieuwe scan (robuste scan parsing)
+#   - QR scan -> ✅ melding + 🔊 scan-beep (1x per nieuwe scan; robuuste scan parsing)
 #   - 1 veld ordernummer + 1 veld initialen (extra robuust tegen spaties/puntjes/autocorrect)
-#   - Verbruik (afboeken) -> DIRECTE bevestiging op scherm (geen automatische rerun die de melding wegpoetst)
-#   - Knop "➡️ Volgende scan" om te resetten en door te gaan
+#   - Verbruik (afboeken) -> SUPER duidelijke feedback:
+#       * 🔊 success-beep (dubbel)
+#       * 📣 fullscreen overlay "✅ AFGEBOEKT"
+#       * 📳 vibrate (waar ondersteund)
+#     en blijft staan tot gebruiker "➡️ Volgende scan" klikt (stabiel op mobiel)
 #   - Email notificatie bij verbruik (SMTP env vars) (fail-safe)
+#
 # ✅ Admin (pincode):
 #   - Voorraad overzicht + CSV export
 #   - Ontvangst boeken (voorraad +) EN direct label-PDF genereren (DYMO) in één actie
@@ -37,17 +42,15 @@ from reportlab.lib.utils import ImageReader
 # -----------------------------
 # Validation / formats
 # -----------------------------
-# Flexibel KEN orderformat: ddd-yyL<digits...>  (bv. 005-26R01, 005-26S1, 123-27R001)
-ORDER_RE = re.compile(r"^\d{3}-\d{2}[A-Z]\d+$")
+ORDER_RE = re.compile(r"^\d{3}-\d{2}[A-Z]\d+$")  # 005-26R01 (ddd-yyLnnn...)
 INITIALS_RE = re.compile(r"^[A-Z]{2}$")
 
-# DYMO 99012 default: 89mm x 36mm (breedte x hoogte)
-LABEL_W_MM = 89
+LABEL_W_MM = 89  # DYMO 99012
 LABEL_H_MM = 36
 
 
 # -----------------------------
-# Robust normalization
+# Normalization helpers (mobile-proof)
 # -----------------------------
 def normalize_initials(s: str) -> str:
     letters = "".join(ch for ch in (s or "") if ch.isalpha()).upper()
@@ -59,6 +62,10 @@ def normalize_order_no(s: str) -> str:
 
 
 def normalize_scan_value(qr_result) -> str:
+    """
+    Scanner output is niet altijd een string (soms dict/object).
+    We normaliseren naar een nette string.
+    """
     if qr_result is None:
         return ""
     if isinstance(qr_result, str):
@@ -73,17 +80,87 @@ def normalize_scan_value(qr_result) -> str:
 
 
 # -----------------------------
-# UX: browser beep on scan
+# Sound + Big overlay feedback
 # -----------------------------
-def play_beep():
-    beep_base64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
+_BEEP_WAV_BASE64 = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
+
+
+def play_beep_scan():
     st.markdown(
         f"""
         <audio autoplay>
-            <source src="data:audio/wav;base64,{beep_base64}" type="audio/wav">
+            <source src="data:audio/wav;base64,{_BEEP_WAV_BASE64}" type="audio/wav">
         </audio>
         """,
         unsafe_allow_html=True,
+    )
+
+
+def play_beep_success():
+    # Speel dezelfde beep 2x om succes duidelijker te maken
+    st.markdown(
+        f"""
+        <audio autoplay>
+            <source src="data:audio/wav;base64,{_BEEP_WAV_BASE64}" type="audio/wav">
+        </audio>
+        <audio autoplay>
+            <source src="data:audio/wav;base64,{_BEEP_WAV_BASE64}" type="audio/wav">
+        </audio>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def show_big_confirmation(title: str, lines: list[str], vibrate_ms: int = 220):
+    body = "<br>".join(lines)
+    st.markdown(
+        f"""
+        <style>
+        .confirm-overlay {{
+            position: fixed;
+            top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            background: rgba(0,0,0,0.72);
+            z-index: 99999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        .confirm-card {{
+            width: min(680px, 92vw);
+            background: white;
+            border-radius: 18px;
+            padding: 24px 20px;
+            box-shadow: 0 18px 40px rgba(0,0,0,0.35);
+            text-align: center;
+        }}
+        .confirm-title {{
+            font-size: 30px;
+            font-weight: 900;
+            margin-bottom: 12px;
+        }}
+        .confirm-body {{
+            font-size: 19px;
+            line-height: 1.35;
+        }}
+        </style>
+
+        <div class="confirm-overlay">
+          <div class="confirm-card">
+            <div class="confirm-title">{title}</div>
+            <div class="confirm-body">{body}</div>
+          </div>
+        </div>
+
+        <script>
+          window.scrollTo(0,0);
+          try {{
+            if (navigator.vibrate) navigator.vibrate({vibrate_ms});
+          }} catch (e) {{}}
+        </script>
+        """,
+        unsafe_allow_html=True
     )
 
 
@@ -301,9 +378,9 @@ ensure_tables()
 
 # Session defaults
 st.session_state.setdefault("spring_no", "")
-st.session_state.setdefault("last_scanned", "")          # beep gating
-st.session_state.setdefault("confirm_block", None)       # dict with last confirmation to show reliably
-st.session_state.setdefault("last_receive_pdf", None)    # bytes
+st.session_state.setdefault("last_scanned", "")          # beep gating for scan
+st.session_state.setdefault("confirm_block", None)       # robust success confirmation
+st.session_state.setdefault("last_receive_pdf", None)
 st.session_state.setdefault("last_receive_pdf_name", None)
 
 # Persist input fields across reruns (mobile friendly)
@@ -318,9 +395,24 @@ page = st.sidebar.radio("Menu", ["📱 Verbruik (medewerker)", "📦 Voorraad & 
 if page == "📱 Verbruik (medewerker)":
     st.title("Veer verbruik (QR)")
 
-    # 0) Toon bevestiging (blijft staan totdat gebruiker op "Volgende scan" klikt)
+    # If we have a confirmation block, show HUGE confirmation + sound and stop.
     if st.session_state.get("confirm_block"):
         info = st.session_state["confirm_block"]
+
+        # Super obvious success feedback
+        play_beep_success()
+        show_big_confirmation(
+            "✅ AFGEBOEKT",
+            [
+                f"<b>Veer:</b> {info['spring_no']}",
+                f"<b>Order:</b> {info['order_no']}",
+                f"<b>Aantal:</b> {info['qty']}",
+                f"<b>Voorraad:</b> {info['before']} → {info['after']}",
+            ],
+            vibrate_ms=220,
+        )
+
+        # Also show details below overlay
         st.success(
             f"""✅ **Verbruik succesvol afgeboekt**
 
@@ -341,16 +433,17 @@ if page == "📱 Verbruik (medewerker)":
             st.session_state["last_scanned"] = ""
             st.rerun()
 
-        st.stop()  # stop hier zodat de rest van de pagina niet interfereert
+        st.stop()
 
     st.subheader("1) Scan QR")
     qr_raw = qrcode_scanner(key="scan")
     qr_text = normalize_scan_value(qr_raw)
 
+    # Beep 1x per NEW scan
     if qr_text and qr_text != st.session_state.get("last_scanned", ""):
         st.session_state["spring_no"] = qr_text
         st.session_state["last_scanned"] = qr_text
-        play_beep()
+        play_beep_scan()
 
     spring_no = st.session_state.get("spring_no", "")
 
@@ -364,13 +457,12 @@ if page == "📱 Verbruik (medewerker)":
     with st.form("use_form", clear_on_submit=False):
         c1, c2 = st.columns(2)
 
-        initials_raw = c1.text_input(
+        st.text_input(
             "Initialen (2 letters)",
             key="initials_raw",
             placeholder="PV",
         )
-
-        order_raw = c2.text_input(
+        st.text_input(
             "Ordernummer",
             key="order_raw",
             placeholder="005-26R01",
@@ -378,8 +470,8 @@ if page == "📱 Verbruik (medewerker)":
 
         qty = st.number_input("Aantal", min_value=1, step=1, value=1)
 
-        initials_preview = normalize_initials(initials_raw)
-        order_preview = normalize_order_no(order_raw)
+        initials_preview = normalize_initials(st.session_state.get("initials_raw", ""))
+        order_preview = normalize_order_no(st.session_state.get("order_raw", ""))
         st.caption(f"Herkenning: initialen **{initials_preview or '-'}**, order **{order_preview or '-'}**")
         st.caption("Order format: 005-26R01 (ddd-yyLnnn...)")
 
@@ -407,6 +499,7 @@ if page == "📱 Verbruik (medewerker)":
             try:
                 before, after = use_stock(spring_clean, int(qty), initials_clean, order_clean)
 
+                # Email (fail-safe)
                 subj = f"Veer gebruikt – {order_clean}"
                 body = (
                     f"Er is een veer gebruikt.\n\n"
@@ -419,7 +512,7 @@ if page == "📱 Verbruik (medewerker)":
                 )
                 ok, msg = send_email(subj, body)
 
-                # ✅ Zet confirm block en STOP met reruns: user moet zelf "Volgende scan" klikken
+                # Set confirmation block and rerun -> next render shows big overlay + sound
                 st.session_state["confirm_block"] = {
                     "spring_no": spring_clean,
                     "order_no": order_clean,
@@ -430,7 +523,7 @@ if page == "📱 Verbruik (medewerker)":
                     "email_msg": msg,
                 }
 
-                # scan reset alvast klaarzetten
+                # reset scan state (order/initials blijven staan voor herhaalverbruik)
                 st.session_state["spring_no"] = ""
                 st.session_state["last_scanned"] = ""
 
